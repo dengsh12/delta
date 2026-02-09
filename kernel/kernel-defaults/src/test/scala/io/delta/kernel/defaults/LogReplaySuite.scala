@@ -338,4 +338,70 @@ trait AbstractLogReplaySuite extends AnyFunSuite {
       assert(!snapshot.getCurrentCrcInfo.isPresent)
     }
   }
+
+  test("full log replay for scan doesn't cache CRC info") {
+    withTempDir { tempFile =>
+      val tablePath = tempFile.getAbsolutePath
+      // Create table with version 0
+      spark.sql(
+        s"CREATE TABLE delta.`$tablePath` USING DELTA AS " +
+          s"SELECT 0L as id")
+      // Insert more data - version 1
+      spark.sql(s"INSERT INTO delta.`$tablePath` SELECT 1L as id")
+      // Insert more data - version 2
+      spark.sql(s"INSERT INTO delta.`$tablePath` SELECT 2L as id")
+
+      // Delete all CRC files
+      deleteChecksumFileForTable(tablePath, versions = Seq(0, 1, 2))
+
+      val snapshot = getTableManagerAdapter.getSnapshotAtLatest(defaultEngine, tablePath)
+        .asInstanceOf[SnapshotImpl]
+
+      // Verify we're at the latest version
+      assert(snapshot.getVersion == 2, "Snapshot should be at version 2")
+
+      // Before scan - no CRC available
+      assert(!snapshot.getCurrentCrcInfo.isPresent)
+
+      // Trigger full log replay - collectScanFileRows iterates through all add files
+      val scanFileRows = collectScanFileRows(snapshot.getScanBuilder().build())
+
+      // Verify LogSegment was loaded (log replay happened)
+      assert(
+        snapshot.getLazyLogSegment.isPresent,
+        "LogSegment should be loaded after scan")
+
+      // Verify LogSegment is at the correct version
+      val logSegment = snapshot.getLogSegment
+      assert(
+        logSegment.getVersion == 2,
+        s"LogSegment version should be 2, got ${logSegment.getVersion}")
+
+      // Verify all delta files in the log segment were processed (full replay)
+      val deltaFilesInLogSegment = logSegment.getDeltas.size()
+      assert(
+        deltaFilesInLogSegment == 3,
+        s"LogSegment should have 3 delta files (v0, v1, v2), got $deltaFilesInLogSegment")
+
+      // Verify scan file count matches Spark's view
+      val expectedFileCount = spark.read.format("delta").load(tablePath).inputFiles.length
+      assert(
+        scanFileRows.size == expectedFileCount,
+        s"Should have replayed all $expectedFileCount files, got ${scanFileRows.size}")
+
+      // Verify row count matches (proves we read the complete table state)
+      val kernelRowCount = readSnapshot(snapshot).size
+      val sparkRowCount = spark.read.format("delta").load(tablePath).count().toInt
+      assert(
+        kernelRowCount == sparkRowCount,
+        s"Kernel row count ($kernelRowCount) should match Spark ($sparkRowCount)")
+
+      // After full log replay - CRC is still not cached/computed
+      // This demonstrates the optimization opportunity: we replayed the log but didn't cache CRC
+      assert(
+        !snapshot.getCurrentCrcInfo.isPresent,
+        "CRC should still be empty even after full log replay - " +
+          "this is the current behavior we want to optimize")
+    }
+  }
 }
